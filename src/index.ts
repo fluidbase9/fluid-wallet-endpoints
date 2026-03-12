@@ -5,27 +5,35 @@
  *
  * Supported chains  : Ethereum · Base · Solana
  * Supported tokens  : USDC only
- * Wallet auth       : Fluid Firebase authentication
+ * Key auth          : Seed-phrase derived API key (HMAC-SHA256, client-side only)
  * Routing           : FluidSOR smart contract (Base mainnet)
  *
- * The seed phrase NEVER leaves the browser.
- * Only a SHA-256 hash of the derived API key is sent to the server.
+ * The seed phrase NEVER leaves the browser / your server.
+ * Only a SHA-256 hash of the derived API key is sent to the Fluid backend.
+ *
+ * Send / Swap use server-side execution:
+ *   The Fluid backend executes transactions using the developer's Fluid in-app
+ *   wallet (derived from their email via walletDerivationService).
+ *   No local signing required — just pass chain, to, amount (for send) or
+ *   tokenIn, tokenOut, amountIn (for swap).
  */
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface WalletSet {
   mnemonic:    string;   // BIP-39 seed phrase (12 words) — keep secret, never send to server
-  ethAddress:  string;   // Ethereum mainnet address  (m/44'/60'/0'/0/0)
-  baseAddress: string;   // Base mainnet address      (same key as ETH — Base is EVM L2)
-  solAddress:  string;   // Solana mainnet address    (m/44'/501'/0'/0')
   apiKey:      string;   // Fluid SDK key: fw_sor_... (HMAC-SHA256 of mnemonic, client-side only)
+  // Wallet addresses are derived server-side from email via walletDerivationService.
+  // The fields below are returned by registerKey() after server-side derivation.
+  ethAddress?:  string;   // Ethereum mainnet address (server-derived)
+  baseAddress?: string;   // Base mainnet address     (server-derived)
+  solAddress?:  string;   // Solana mainnet address   (server-derived)
 }
 
 export interface RegisterKeyResponse {
   success:          boolean;
-  supportedChains:  string[];   // ["ethereum", "base", "solana"]
-  supportedTokens:  string[];   // ["USDC"]
+  supportedChains:  string[];
+  supportedTokens:  string[];
   wallets: {
     ethereum: string | null;
     base:     string | null;
@@ -73,6 +81,41 @@ export interface SorQuoteResponse {
   error?:     string;
 }
 
+export interface BalanceResponse {
+  success:  boolean;
+  balance:  string;   // USDC balance as a decimal string e.g. "42.50"
+  address:  string;   // The registered wallet address queried
+  chain:    string;
+  token:    "USDC";
+  error?:   string;
+}
+
+export interface SendResponse {
+  success:     boolean;
+  txHash?:     string;
+  explorerUrl?: string;
+  from?:       string;
+  to?:         string;
+  amount?:     string;
+  chain?:      string;
+  error?:      string;
+  message?:    string;
+}
+
+export interface SwapResponse {
+  success:     boolean;
+  txHash?:     string;
+  explorerUrl?: string;
+  from?:       string;
+  tokenIn?:    string;
+  tokenOut?:   string;
+  amountIn?:   string;
+  amountOut?:  string | null;
+  chain?:      string;
+  error?:      string;
+  message?:    string;
+}
+
 // ─── Crypto helpers ──────────────────────────────────────────────────────────
 
 /**
@@ -80,7 +123,7 @@ export interface SorQuoteResponse {
  * Performed entirely client-side — the mnemonic never leaves the browser.
  *
  * @param mnemonic  12-word BIP-39 seed phrase
- * @returns         API key in the form "fw_sor_<48 hex chars>"
+ * @returns         API key in the form "fw_sor_<24 hex chars>"
  */
 export async function deriveSdkApiKey(mnemonic: string): Promise<string> {
   const enc = new TextEncoder();
@@ -111,62 +154,111 @@ export class FluidWalletClient {
   private apiKey:  string | null;
 
   /**
-   * @param baseUrl   Base URL of the Fluid backend (default: "https://fluidnative.com")
-   * @param apiKey    SDK API key (fw_sor_...) — required for /api/sor/quote
+   * @param baseUrl  Base URL of the Fluid backend (default: "https://fluidnative.com")
+   * @param apiKey   SDK API key (fw_sor_...) — required for all protected endpoints
    */
   constructor(baseUrl = "https://fluidnative.com", apiKey: string | null = null) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.apiKey  = apiKey;
   }
 
-  // ── Authentication ─────────────────────────────────────────────────────────
+  private get authHeader(): Record<string, string> {
+    if (!this.apiKey) throw new Error("API key required. Pass it to the FluidWalletClient constructor.");
+    return { "x-fluid-api-key": this.apiKey };
+  }
+
+  // ── Key management ─────────────────────────────────────────────────────────
 
   /**
-   * Register an SDK developer API key and wallet addresses with Fluid.
+   * Register your SDK API key and wallet addresses with Fluid.
    *
-   * IMPORTANT: Never pass the raw mnemonic to this method.
-   * Use deriveSdkApiKey() + hashApiKey() client-side first.
-   *
-   * @param email       Developer's email (Fluid Firebase account)
-   * @param keyHash     sha256(apiKey)  — 64-char hex
-   * @param keyHint     First 12 chars of apiKey for display e.g. "fw_sor_a3f8c"
-   * @param ethAddress  Ethereum wallet address (0x...)
-   * @param baseAddress Base wallet address   (0x...)  — same as ethAddress
-   * @param solAddress  Solana wallet address (base58)
+   * Never pass the raw mnemonic — use deriveSdkApiKey() + hashApiKey() first.
+   * This is called once from the Fluid Wallet Developer Console.
    */
   async registerKey(
-    email:       string,
-    keyHash:     string,
-    keyHint:     string,
-    ethAddress?: string,
+    email:        string,
+    keyHash:      string,
+    keyHint:      string,
+    ethAddress?:  string,
     baseAddress?: string,
-    solAddress?: string,
+    solAddress?:  string,
   ): Promise<RegisterKeyResponse> {
     const res = await fetch(`${this.baseUrl}/api/developer/register-key`, {
-      method: "POST",
+      method:  "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, keyHash, keyHint, ethAddress, baseAddress, solAddress }),
+      body:    JSON.stringify({ email, keyHash, keyHint, ethAddress, baseAddress, solAddress }),
     });
     return res.json();
   }
 
   /**
-   * Look up API key metadata by email.
-   * Returns wallet addresses and key status — never the key itself.
+   * Look up your API key metadata by email.
+   * Returns wallet addresses and key status — never the key hash itself.
    */
   async getKeyInfo(email: string): Promise<KeyInfoResponse> {
-    const res = await fetch(`${this.baseUrl}/api/developer/key-info?email=${encodeURIComponent(email)}`);
+    const res = await fetch(
+      `${this.baseUrl}/api/developer/key-info?email=${encodeURIComponent(email)}`
+    );
     return res.json();
   }
 
   /**
-   * Deactivate an API key. All subsequent requests using this key will be rejected.
+   * Deactivate your API key. All subsequent API requests using it will be rejected.
    */
   async deactivateKey(email: string): Promise<{ success: boolean; error?: string }> {
     const res = await fetch(`${this.baseUrl}/api/developer/deactivate-key`, {
-      method: "POST",
+      method:  "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email }),
+      body:    JSON.stringify({ email }),
+    });
+    return res.json();
+  }
+
+  // ── Balance ────────────────────────────────────────────────────────────────
+
+  /**
+   * Get the USDC balance of your registered wallet address on the specified chain.
+   *
+   * The address used is the one registered when you derived your API key.
+   * No signing required — read-only.
+   *
+   * @param chain  "base" (default) | "ethereum" | "solana"
+   *
+   * @example
+   * const { balance } = await client.getBalance("base");
+   * console.log(`${balance} USDC on Base`);
+   */
+  async getBalance(chain: "base" | "ethereum" | "solana" = "base"): Promise<BalanceResponse> {
+    const res = await fetch(
+      `${this.baseUrl}/api/v1/wallet/balance?chain=${chain}`,
+      { headers: this.authHeader }
+    );
+    return res.json();
+  }
+
+  // ── Send ───────────────────────────────────────────────────────────────────
+
+  /**
+   * Send USDC through Fluid. The server executes the transaction using your
+   * Fluid in-app wallet (derived server-side from your email). No local signing required.
+   *
+   * For Solana, a signed transaction is still required (server-side Solana execution coming soon).
+   *
+   * @param params.chain     "base" | "ethereum" | "solana"
+   * @param params.to        Recipient address
+   * @param params.amount    Amount of USDC to send (decimal string, e.g. "10.50")
+   * @param params.signedTx  Optional — only required for Solana (base64 encoded tx)
+   */
+  async send(params: {
+    chain:     "base" | "ethereum" | "solana";
+    to:        string;
+    amount:    string;
+    signedTx?: string;
+  }): Promise<SendResponse> {
+    const res = await fetch(`${this.baseUrl}/api/v1/wallet/send`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", ...this.authHeader },
+      body:    JSON.stringify(params),
     });
     return res.json();
   }
@@ -176,19 +268,58 @@ export class FluidWalletClient {
   /**
    * Get the best swap routes from the Fluid Smart Order Router.
    *
-   * Requires a registered SDK API key (set via constructor or setApiKey()).
+   * Supported networks and their routers:
+   *   base      → Fluid AMM, Uniswap V3, Aerodrome, PancakeSwap, SushiSwap, Odos, Balancer + more
+   *   ethereum  → Uniswap V3, SushiSwap, PancakeSwap, Balancer + more
+   *   solana    → Jupiter (aggregates Raydium, Orca, Meteora, Phoenix, etc.)
+   *   injective → Helix DEX (price-based)
    *
-   * Currently only USDC pairs are supported:
-   *   USDC → USDT, USDT → USDC, USDC → WETH, WETH → USDC
-   *
-   * @param tokenIn   Input token symbol  (e.g. "USDC")
-   * @param tokenOut  Output token symbol (e.g. "USDT")
-   * @param amountIn  Amount to swap      (e.g. "100")
+   * @param tokenIn   e.g. "SOL", "USDC", "WETH"
+   * @param tokenOut  e.g. "USDC", "USDT", "WETH"
+   * @param amountIn  e.g. "100"
+   * @param network   "base" | "ethereum" | "solana" | "injective"  (default: "base")
    */
-  async getQuote(tokenIn: string, tokenOut: string, amountIn: string): Promise<SorQuoteResponse> {
-    if (!this.apiKey) throw new Error("API key required. Pass it to the FluidWalletClient constructor.");
-    const url = `${this.baseUrl}/api/sor/quote?tokenIn=${tokenIn}&tokenOut=${tokenOut}&amountIn=${amountIn}`;
-    const res = await fetch(url, { headers: { "x-fluid-api-key": this.apiKey } });
+  async getQuote(
+    tokenIn:  string,
+    tokenOut: string,
+    amountIn: string,
+    network:  "base" | "ethereum" | "solana" | "injective" = "base",
+  ): Promise<SorQuoteResponse> {
+    const url = `${this.baseUrl}/api/sor/wallet-quote?tokenIn=${tokenIn}&tokenOut=${tokenOut}&amountIn=${amountIn}&network=${network}`;
+    const res = await fetch(url, { headers: this.authHeader });
+    return res.json();
+  }
+
+  // ── SOR Swap (execute) ────────────────────────────────────────────────────
+
+  /**
+   * Execute a FluidSOR swap through Fluid. The server executes the swap using
+   * your Fluid in-app wallet (derived server-side from your email).
+   * No local signing required — just provide the token symbols and amounts.
+   *
+   * Flow:
+   *   1. Call getQuote() to get routes + amountOut
+   *   2. Call swap() with tokenIn, tokenOut, amountIn, and amountOut from the quote
+   *   3. Fluid executes the swap server-side and records it to your swap history
+   *
+   * @param params.tokenIn   Input token symbol  (e.g. "USDC")
+   * @param params.tokenOut  Output token symbol (e.g. "WETH")
+   * @param params.amountIn  Amount in           (e.g. "100")
+   * @param params.amountOut Expected amount out from getQuote (e.g. "0.03521")
+   * @param params.signedTx  Optional — accepted for backwards compat but not required
+   */
+  async swap(params: {
+    tokenIn:    string;
+    tokenOut:   string;
+    amountIn:   string;
+    amountOut?: string;
+    signedTx?:  string;
+  }): Promise<SwapResponse> {
+    const res = await fetch(`${this.baseUrl}/api/v1/sor/swap`, {
+      method:  "POST",
+      headers: { "Content-Type": "application/json", ...this.authHeader },
+      body:    JSON.stringify(params),
+    });
     return res.json();
   }
 
