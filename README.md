@@ -152,8 +152,9 @@ Only USDC pairs are supported currently:
 
 ## Security
 
-- Seed phrase is generated in the browser and **never sent to any server**
-- Fluid stores only `sha256(apiKey)` — never the key itself
+- Seed phrase is entered once via hidden terminal input — **never echoed, never written to disk, never sent to any server**
+- The CLI derives your private key in-process (BIP-44 `m/44'/60'/0'/0/0`) — only the derived key is saved to `.env.local`
+- Fluid stores only `sha256(apiKey)` — never the raw key or seed phrase
 - Wallet addresses are stored for identification only — Fluid cannot move your funds
 - Authentication uses Firebase — your password is hashed by Firebase, Fluid never sees it
 - API key can be revoked instantly via `deactivateKey()` and re-derived from your seed phrase
